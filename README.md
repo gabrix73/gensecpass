@@ -379,7 +379,7 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 ### Inspiration
 
-- [mouse_entropy](https://github.com/c-goes/mouse_entropy) - Original mouse entropy concept
+- [mouse_entropy](https://github.com/Ch1ffr3punk/mouse_entropy) - Original mouse entropy concept
 
 ---
 
