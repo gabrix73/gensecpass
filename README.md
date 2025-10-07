@@ -393,7 +393,7 @@ This software is provided "as is" without warranty. The quantum-safe layer is cu
 
 ## 📧 Contact
 
-- **Author**: Gabriel (gabrix73)
+- **Author**: Gabx (gabrix73)
 - **Email**: gabriel1@frozenstar.info
 - **GitHub**: [@gabrix73](https://github.com/gabrix73)
 
