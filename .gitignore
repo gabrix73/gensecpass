@@ -1,0 +1,27 @@
+  # Binaries
+  gensecpass
+  gensecpass_age_bind
+
+  # Backup files
+  *.bak
+  *.backup
+  *.BKP
+
+  # Encrypted files
+  *.age
+  password.txt
+
+  # Go artifacts
+  *.exe
+  *.test
+  *.out
+  vendor/
+  go.work
+
+  # IDE
+  .vscode/
+  .idea/
+  *.swp
+
+  # OS
+  .DS_Store
