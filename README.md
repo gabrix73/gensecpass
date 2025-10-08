@@ -120,7 +120,12 @@ cd gensecpass
 go mod download
 
 # Build
-go build -v -o gensecpass gensecpass.go
+go build \
+  -ldflags="-s -w" \
+  -trimpath \
+  -buildmode=pie \
+  -o gensecpass \
+  gensecpass.go  
 
 # Optional: Install to system
 sudo cp gensecpass /usr/local/bin/
