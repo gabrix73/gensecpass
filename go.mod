@@ -1,14 +1,15 @@
-module gensecpass2-simple
+module gensecpass2
 
-go 1.21
+go 1.25.3
 
 require (
-	github.com/awnumar/memguard v0.22.5
-	golang.org/x/crypto v0.31.0
-	golang.org/x/term v0.27.0
+	filippo.io/age v1.2.1
+	github.com/awnumar/memguard v0.23.0
+	golang.org/x/term v0.36.0
 )
 
 require (
-	github.com/awnumar/memcall v0.2.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
+	github.com/awnumar/memcall v0.4.0 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
+	golang.org/x/sys v0.37.0 // indirect
 )
