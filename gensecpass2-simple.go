@@ -2,704 +2,737 @@ package main
 
 import (
 	"bufio"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
+	"filippo.io/age"
 	"github.com/awnumar/memguard"
-	"golang.org/x/crypto/argon2"
 	"golang.org/x/term"
 )
 
 const (
-	version           = "2.0.0-simple"
+	version           = "2.1.0"
 	minLength         = 8
 	maxLength         = 256
 	defaultLength     = 16
-	charSet           = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?/\""
-	defaultOutputFile = "password.txt.enc"
-	minMouseEntropy   = 256
-	minKeyEntropy     = 128
-	entropyTimeout    = 120 * time.Second
-	
-	// Argon2id parameters (quantum-resistant KDF)
-	argon2Time    = 4      // More iterations for security
-	argon2Memory  = 128 * 1024 // 128 MB memory-hard
-	argon2Threads = 4
-	argon2KeyLen  = 32
-	
-	// DoD 5220.22-M wipe: 7 passes
-	wipePatterns = 7
+	charSet           = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?/"
+	defaultOutputFile = "password.txt.age"
+	challenge1Target  = 128 // bytes di entropia - challenge 1 (veloce)
+	challenge2Target  = 256 // bytes di entropia - challenge 2 (ritmico)
+	entropyTimeout    = 90 * time.Second
+	wipePassCount     = 7 // DoD 5220.22-M standard
 )
 
-type EntropyCollector struct {
-	mouseData    []byte
-	keyboardData []byte
-	startTime    time.Time
-	finished     bool
+type EntropySource struct {
+	data      []byte
+	hash      []byte
+	startTime time.Time
+	timings   []int64 // nanosecondi tra pressioni tasti
 }
 
-func NewEntropyCollector() *EntropyCollector {
-	return &EntropyCollector{
-		mouseData:    make([]byte, 0, minMouseEntropy*2),
-		keyboardData: make([]byte, 0, minKeyEntropy*2),
-		startTime:    time.Now(),
+func NewEntropySource() *EntropySource {
+	return &EntropySource{
+		data:      make([]byte, 0, 512),
+		timings:   make([]int64, 0, 256),
+		startTime: time.Now(),
 	}
 }
 
-func (ec *EntropyCollector) CollectKeyboardEntropy(targetBytes int, verbose bool) error {
-	fmt.Println("⌨️  Type random characters for keyboard entropy...")
-	fmt.Printf("📊 Target: %d bytes (press ENTER when done)\n", targetBytes)
-	fmt.Println("💡 Tip: Random keys, varying timing\n")
+func (es *EntropySource) AddByte(b byte, timestamp int64) {
+	es.data = append(es.data, b)
+	
+	// Aggiungi timing se non è il primo byte
+	if len(es.timings) > 0 {
+		delta := timestamp - es.timings[len(es.timings)-1]
+		// Converti delta in bytes (8 bytes)
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, uint64(delta))
+		es.data = append(es.data, buf...)
+	}
+	
+	es.timings = append(es.timings, timestamp)
+}
 
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+func (es *EntropySource) AddTimestamp() {
+	now := time.Now().UnixNano()
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, uint64(now))
+	es.data = append(es.data, buf...)
+}
+
+func (es *EntropySource) Finalize() {
+	// Hash finale di tutti i dati + timings
+	h := sha256.Sum256(es.data)
+	es.hash = h[:]
+}
+
+func (es *EntropySource) Size() int {
+	return len(es.data)
+}
+
+func (es *EntropySource) TimingStats() (avgDelta, stdDev float64) {
+	if len(es.timings) < 2 {
+		return 0, 0
+	}
+
+	// Calcola media dei delta
+	var sum int64
+	deltas := make([]int64, len(es.timings)-1)
+	for i := 1; i < len(es.timings); i++ {
+		delta := es.timings[i] - es.timings[i-1]
+		deltas[i-1] = delta
+		sum += delta
+	}
+	avgDelta = float64(sum) / float64(len(deltas))
+
+	// Calcola deviazione standard
+	var variance float64
+	for _, delta := range deltas {
+		diff := float64(delta) - avgDelta
+		variance += diff * diff
+	}
+	variance /= float64(len(deltas))
+	stdDev = float64(int64(variance)) // sqrt approssimato
+
+	return avgDelta / 1000000, stdDev / 1000000 // converti in millisecondi
+}
+
+// Challenge 1: Digitazione VELOCE e CAOTICA
+func collectChallenge1Entropy(target int, verbose bool) (*EntropySource, error) {
+	es := NewEntropySource()
+	
+	fmt.Println("\n⚡ CHALLENGE 1: CHAOTIC TYPING")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Printf("📊 Target: %d bytes\n", target)
+	fmt.Println("⏱️  Timeout: 90 seconds")
+	fmt.Println("💡 Type FAST and RANDOMLY:")
+	fmt.Println("   • Slam the keyboard chaotically")
+	fmt.Println("   • Mix letters, numbers, symbols")
+	fmt.Println("   • Don't think, just type!")
+	fmt.Println("   • The more chaotic, the better!")
+	fmt.Println("✅ Press ENTER when done\n")
+
+	// Imposta terminal in raw mode
+	oldState, err := term.MakeRaw(int(syscall.Stdin))
 	if err != nil {
-		return fmt.Errorf("failed to set raw mode: %v", err)
+		return nil, fmt.Errorf("failed to set raw mode: %w", err)
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer term.Restore(int(syscall.Stdin), oldState)
 
 	reader := bufio.NewReader(os.Stdin)
-	lastTime := time.Now()
-	
-	for len(ec.keyboardData) < targetBytes {
-		if time.Since(ec.startTime) > entropyTimeout {
-			return fmt.Errorf("timeout exceeded")
-		}
+	done := make(chan bool)
+	timeout := time.After(entropyTimeout)
 
-		b, err := reader.ReadByte()
-		if err != nil {
-			continue
-		}
-
-		if b == 13 || b == 10 {
-			if len(ec.keyboardData) >= targetBytes {
+	go func() {
+		lastUpdate := time.Now()
+		
+		for {
+			char, err := reader.ReadByte()
+			if err != nil {
 				break
 			}
-			fmt.Printf("\r⚠️  Need %d more bytes...    ", targetBytes-len(ec.keyboardData))
-			continue
+
+			currentTime := time.Now().UnixNano()
+
+			// ENTER per finire
+			if char == 0x0D || char == 0x0A {
+				if es.Size() >= target {
+					done <- true
+					return
+				}
+				continue
+			}
+
+			// Ignora caratteri di controllo (tranne ESC, TAB)
+			if char < 32 && char != 27 && char != 9 {
+				continue
+			}
+
+			// Aggiungi byte con timestamp
+			es.AddByte(char, currentTime)
+
+			// Mostra progresso
+			if time.Since(lastUpdate) > 100*time.Millisecond {
+				progress := float64(es.Size()) * 100.0 / float64(target)
+				if progress > 100 {
+					progress = 100
+				}
+				
+				// Calcola WPM (words per minute) approssimato
+				elapsed := time.Since(es.startTime).Seconds()
+				wpm := int((float64(len(es.timings)) / 5) / elapsed * 60)
+				
+				fmt.Printf("\r🔄 Progress: %.1f%% (%d/%d bytes) | Speed: ~%d WPM", 
+					progress, es.Size(), target, wpm)
+				lastUpdate = time.Now()
+
+				if es.Size() >= target {
+					fmt.Println()
+					done <- true
+					return
+				}
+			}
 		}
+	}()
 
-		currentTime := time.Now()
-		timeDelta := currentTime.Sub(lastTime).Nanoseconds()
-		lastTime = currentTime
-
-		entropy := make([]byte, 17)
-		entropy[0] = b
-		binary.LittleEndian.PutUint64(entropy[1:9], uint64(currentTime.UnixNano()))
-		binary.LittleEndian.PutUint64(entropy[9:17], uint64(timeDelta))
-		
-		ec.keyboardData = append(ec.keyboardData, entropy...)
-
-		progress := float64(len(ec.keyboardData)) / float64(targetBytes) * 100
-		fmt.Printf("\r⌨️  Collected: %d/%d bytes (%.1f%%)    ", len(ec.keyboardData), targetBytes, progress)
+	select {
+	case <-done:
+		fmt.Println("✅ Challenge 1 completed!")
+	case <-timeout:
+		if es.Size() < target/2 {
+			return nil, fmt.Errorf("insufficient entropy collected (timeout)")
+		}
+		fmt.Println("\n⏱️  Timeout reached, using collected data")
 	}
-	
-	fmt.Println("\n✅ Keyboard entropy complete!")
-	return nil
+
+	// Finalizza con hash
+	es.Finalize()
+
+	if verbose {
+		avgDelta, stdDev := es.TimingStats()
+		fmt.Printf("📊 Collected: %d bytes\n", es.Size())
+		fmt.Printf("⌨️  Keystrokes: %d\n", len(es.timings))
+		fmt.Printf("⏱️  Avg timing: %.2f ms (±%.2f ms)\n", avgDelta, stdDev)
+		fmt.Printf("🔐 Hash: %x...\n", es.hash[:8])
+	}
+
+	return es, nil
 }
 
-func (ec *EntropyCollector) CollectMouseEntropy(targetBytes int, verbose bool) error {
-	fmt.Println("🖱️  Move mouse randomly for entropy...")
-	fmt.Printf("📊 Target: %d bytes\n", targetBytes)
-	fmt.Println("💡 Tip: Varied movements - circles, zigzags\n")
+// Challenge 2: Digitazione RITMICA con PAUSE
+func collectChallenge2Entropy(target int, verbose bool) (*EntropySource, error) {
+	es := NewEntropySource()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	fmt.Println("\n🎵 CHALLENGE 2: RHYTHMIC TYPING")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Printf("📊 Target: %d bytes\n", target)
+	fmt.Println("⏱️  Timeout: 90 seconds")
+	fmt.Println("💡 Type with VARYING rhythm:")
+	fmt.Println("   • Type... pause... type quickly... pause")
+	fmt.Println("   • Short bursts, then long pauses")
+	fmt.Println("   • Irregular patterns, unpredictable timing")
+	fmt.Println("   • Think of it as musical rhythm")
+	fmt.Println("✅ Press ENTER when done\n")
 
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	// Imposta terminal in raw mode
+	oldState, err := term.MakeRaw(int(syscall.Stdin))
 	if err != nil {
-		return fmt.Errorf("failed to set raw mode: %v", err)
+		return nil, fmt.Errorf("failed to set raw mode: %w", err)
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer term.Restore(int(syscall.Stdin), oldState)
 
-	mouseChan := make(chan []byte, 100)
-	go ec.readMouseInput(mouseChan)
-
-	for {
-		select {
-		case <-ticker.C:
-			if time.Since(ec.startTime) > entropyTimeout {
-				ec.finished = true
-				return fmt.Errorf("timeout exceeded")
-			}
-
-			progress := float64(len(ec.mouseData)) / float64(targetBytes) * 100
-			elapsed := time.Since(ec.startTime).Seconds()
-			rate := float64(len(ec.mouseData)) / elapsed
-			
-			fmt.Printf("\r🖱️  Collected: %d/%d bytes (%.1f%%) | %.0f B/s    ", 
-				len(ec.mouseData), targetBytes, progress, rate)
-
-			if len(ec.mouseData) >= targetBytes {
-				fmt.Println("\n✅ Mouse entropy complete!")
-				ec.finished = true
-				return nil
-			}
-
-		case mouseData := <-mouseChan:
-			if len(mouseData) > 0 {
-				ec.mouseData = append(ec.mouseData, mouseData...)
-			}
-		}
-	}
-}
-
-func (ec *EntropyCollector) readMouseInput(ch chan<- []byte) {
 	reader := bufio.NewReader(os.Stdin)
-	lastTime := time.Now()
-	
-	for !ec.finished {
-		b, err := reader.ReadByte()
-		if err != nil {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
+	done := make(chan bool)
+	timeout := time.After(entropyTimeout)
+
+	go func() {
+		lastUpdate := time.Now()
+		lastKeyTime := time.Now().UnixNano()
+		var lastDelta int64
 		
-		currentTime := time.Now()
-		timeDelta := currentTime.Sub(lastTime).Nanoseconds()
-		lastTime = currentTime
-		
-		entropy := make([]byte, 17)
-		entropy[0] = b
-		binary.LittleEndian.PutUint64(entropy[1:9], uint64(currentTime.UnixNano()))
-		binary.LittleEndian.PutUint64(entropy[9:17], uint64(timeDelta))
-		
-		ch <- entropy
-	}
-}
-
-func (ec *EntropyCollector) GetCombinedEntropy() []byte {
-	combined := make([]byte, 0, len(ec.keyboardData)+len(ec.mouseData)+64)
-	combined = append(combined, ec.keyboardData...)
-	combined = append(combined, ec.mouseData...)
-	
-	cryptoRandom := make([]byte, 64)
-	io.ReadFull(rand.Reader, cryptoRandom)
-	combined = append(combined, cryptoRandom...)
-	
-	hash := sha256.Sum256(combined)
-	return hash[:]
-}
-
-func generateSecurePassword(length int, entropy []byte) (string, error) {
-	if length < minLength || length > maxLength {
-		return "", fmt.Errorf("invalid length")
-	}
-
-	additionalEntropy := memguard.NewBufferRandom(32)
-	defer additionalEntropy.Destroy()
-
-	combined := make([]byte, len(entropy)+len(additionalEntropy.Data())+32)
-	copy(combined, entropy)
-	copy(combined[len(entropy):], additionalEntropy.Data())
-	io.ReadFull(rand.Reader, combined[len(entropy)+len(additionalEntropy.Data()):])
-
-	password := memguard.NewBuffer(length)
-	defer password.Destroy()
-
-	hash := sha256.Sum256(combined)
-	for i := 0; i < length; i++ {
-		idx := i % len(hash)
-		charIdx := int(hash[idx]) % len(charSet)
-		password.Data()[i] = charSet[charIdx]
-		
-		if (i+1)%16 == 0 && i+1 < length {
-			hash = sha256.Sum256(hash[:])
-		}
-	}
-
-	result := string(password.Data())
-	secureWipe(combined)
-	
-	return result, nil
-}
-
-// Simple quantum-resistant encryption: Argon2id + AES-256-GCM
-// NO NIST KEMs, NO Cloudflare, pure independent stack
-func saveEncryptedPassword(password []byte, outputPath string, verbose bool) error {
-	fmt.Print("\n🔐 Enter passphrase: ")
-	passphraseBuffer, err := readPasswordNoEchoSecure()
-	if err != nil {
-		return fmt.Errorf("failed to read passphrase: %v", err)
-	}
-	defer passphraseBuffer.Destroy()
-
-	fmt.Print("🔐 Confirm passphrase: ")
-	confirmBuffer, err := readPasswordNoEchoSecure()
-	if err != nil {
-		return fmt.Errorf("failed to read confirmation: %v", err)
-	}
-	defer confirmBuffer.Destroy()
-
-	if !passphraseBuffer.EqualTo(confirmBuffer.Data()) {
-		return fmt.Errorf("passphrases do not match")
-	}
-
-	// Generate salt
-	salt := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-		return fmt.Errorf("failed to generate salt: %v", err)
-	}
-
-	if verbose {
-		fmt.Printf("🔬 Quantum-resistant encryption stack:\n")
-		fmt.Printf("   KDF: Argon2id (time=%d, memory=%dMB, threads=%d)\n", 
-			argon2Time, argon2Memory/1024, argon2Threads)
-		fmt.Printf("   Cipher: AES-256-GCM\n")
-		fmt.Printf("   ✅ NO NIST KEMs\n")
-		fmt.Printf("   ✅ NO Cloudflare dependencies\n")
-		fmt.Printf("   ✅ Memory-hard: resists quantum speedup\n")
-	}
-
-	// Derive key with Argon2id (quantum-resistant)
-	derivedKey := argon2.IDKey(
-		passphraseBuffer.Data(),
-		salt,
-		argon2Time,
-		argon2Memory,
-		argon2Threads,
-		argon2KeyLen,
-	)
-	defer secureWipe(derivedKey)
-
-	// Encrypt with AES-256-GCM
-	encryptedData, nonce, err := encryptAESGCM(password, derivedKey)
-	if err != nil {
-		return fmt.Errorf("encryption failed: %v", err)
-	}
-
-	// File format: salt:nonce:encryptedData (all hex-encoded)
-	outFile, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %v", err)
-	}
-	defer outFile.Close()
-
-	_, err = fmt.Fprintf(outFile, "%s:%s:%s\n",
-		hex.EncodeToString(salt),
-		hex.EncodeToString(nonce),
-		hex.EncodeToString(encryptedData))
-	
-	if err != nil {
-		return fmt.Errorf("failed to write file: %v", err)
-	}
-
-	if verbose {
-		fmt.Printf("✅ Password encrypted and saved: %s\n", outputPath)
-		fmt.Printf("📊 File size: %d bytes (salt=%d, nonce=%d, data=%d)\n",
-			len(salt)+len(nonce)+len(encryptedData)+2, // +2 for colons
-			len(salt), len(nonce), len(encryptedData))
-	}
-
-	return nil
-}
-
-func decryptPassword(filePath string, verbose bool) error {
-	fmt.Print("🔐 Enter passphrase: ")
-	passphraseBuffer, err := readPasswordNoEchoSecure()
-	if err != nil {
-		return fmt.Errorf("failed to read passphrase: %v", err)
-	}
-	defer passphraseBuffer.Destroy()
-
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %v", err)
-	}
-
-	// Parse: salt:nonce:encryptedData
-	strData := strings.TrimSpace(string(data))
-	parts := strings.Split(strData, ":")
-	
-	if len(parts) != 3 {
-		return fmt.Errorf("invalid file format (expected 3 parts, got %d)", len(parts))
-	}
-
-	salt, err := hex.DecodeString(parts[0])
-	if err != nil {
-		return fmt.Errorf("failed to decode salt: %v", err)
-	}
-
-	nonce, err := hex.DecodeString(parts[1])
-	if err != nil {
-		return fmt.Errorf("failed to decode nonce: %v", err)
-	}
-
-	encryptedData, err := hex.DecodeString(parts[2])
-	if err != nil {
-		return fmt.Errorf("failed to decode encrypted data: %v", err)
-	}
-
-	if verbose {
-		fmt.Printf("🔬 Decrypting with Argon2id + AES-256-GCM\n")
-	}
-
-	// Derive key with Argon2id
-	derivedKey := argon2.IDKey(
-		passphraseBuffer.Data(),
-		salt,
-		argon2Time,
-		argon2Memory,
-		argon2Threads,
-		argon2KeyLen,
-	)
-	defer secureWipe(derivedKey)
-
-	// Decrypt
-	plaintext, err := decryptAESGCM(encryptedData, derivedKey, nonce)
-	if err != nil {
-		return fmt.Errorf("decryption failed (wrong passphrase?): %v", err)
-	}
-	defer secureWipe(plaintext)
-
-	fmt.Printf("\n🔓 Decrypted Password: %s\n", string(plaintext))
-	fmt.Println("💀 Password wiped from memory")
-
-	return nil
-}
-
-func encryptAESGCM(plaintext, key []byte) (ciphertext, nonce []byte, err error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	nonce = make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, nil, err
-	}
-
-	ciphertext = gcm.Seal(nil, nonce, plaintext, nil)
-	return ciphertext, nonce, nil
-}
-
-func decryptAESGCM(ciphertext, key, nonce []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return plaintext, nil
-}
-
-// DoD 5220.22-M secure file wipe
-func secureFileWipe(filePath string, verbose bool) error {
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		return fmt.Errorf("cannot access file: %v", err)
-	}
-
-	fileSize := fileInfo.Size()
-	
-	if verbose {
-		fmt.Printf("🔥 Secure wipe: %s\n", filePath)
-		fmt.Printf("📊 Size: %d bytes\n", fileSize)
-		fmt.Printf("🔁 DoD 5220.22-M (%d passes)\n", wipePatterns)
-	}
-
-	file, err := os.OpenFile(filePath, os.O_RDWR, 0666)
-	if err != nil {
-		return fmt.Errorf("failed to open: %v", err)
-	}
-	defer file.Close()
-
-	patterns := []byte{0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF}
-
-	// Passes 1-6: alternating patterns
-	for pass := 0; pass < len(patterns); pass++ {
-		if _, err := file.Seek(0, 0); err != nil {
-			return fmt.Errorf("seek failed pass %d: %v", pass+1, err)
-		}
-
-		pattern := make([]byte, 4096)
-		for i := range pattern {
-			pattern[i] = patterns[pass]
-		}
-
-		written := int64(0)
-		for written < fileSize {
-			toWrite := int64(len(pattern))
-			if written+toWrite > fileSize {
-				toWrite = fileSize - written
-			}
-			
-			n, err := file.Write(pattern[:toWrite])
+		for {
+			char, err := reader.ReadByte()
 			if err != nil {
-				return fmt.Errorf("write failed pass %d: %v", pass+1, err)
+				break
 			}
-			written += int64(n)
-		}
 
-		if err := file.Sync(); err != nil {
-			return fmt.Errorf("sync failed pass %d: %v", pass+1, err)
-		}
+			currentTime := time.Now().UnixNano()
+			delta := currentTime - lastKeyTime
 
-		if verbose {
-			fmt.Printf("✅ Pass %d/%d (0x%02X)\n", pass+1, wipePatterns, patterns[pass])
+			// ENTER per finire
+			if char == 0x0D || char == 0x0A {
+				if es.Size() >= target {
+					done <- true
+					return
+				}
+				continue
+			}
+
+			// Ignora caratteri di controllo
+			if char < 32 && char != 27 && char != 9 {
+				continue
+			}
+
+			// Aggiungi byte con timestamp
+			es.AddByte(char, currentTime)
+
+			// Feedback visivo sulla variazione del ritmo
+			var rhythmIndicator string
+			if len(es.timings) > 1 {
+				if delta > lastDelta*2 {
+					rhythmIndicator = "🐌 SLOW"
+				} else if delta < lastDelta/2 {
+					rhythmIndicator = "⚡ FAST"
+				} else {
+					rhythmIndicator = "➡️  STEADY"
+				}
+			}
+
+			lastDelta = delta
+			lastKeyTime = currentTime
+
+			// Mostra progresso con feedback ritmico
+			if time.Since(lastUpdate) > 100*time.Millisecond {
+				progress := float64(es.Size()) * 100.0 / float64(target)
+				if progress > 100 {
+					progress = 100
+				}
+				
+				deltaMs := delta / 1000000 // converti in millisecondi
+				fmt.Printf("\r🔄 Progress: %.1f%% (%d/%d bytes) | Rhythm: %s (%dms)", 
+					progress, es.Size(), target, rhythmIndicator, deltaMs)
+				lastUpdate = time.Now()
+
+				if es.Size() >= target {
+					fmt.Println()
+					done <- true
+					return
+				}
+			}
 		}
+	}()
+
+	select {
+	case <-done:
+		fmt.Println("✅ Challenge 2 completed!")
+	case <-timeout:
+		if es.Size() < target/2 {
+			return nil, fmt.Errorf("insufficient entropy collected (timeout)")
+		}
+		fmt.Println("\n⏱️  Timeout reached, using collected data")
 	}
 
-	// Pass 7: random data
-	if _, err := file.Seek(0, 0); err != nil {
-		return fmt.Errorf("seek failed random pass: %v", err)
+	// Finalizza con hash
+	es.Finalize()
+
+	if verbose {
+		avgDelta, stdDev := es.TimingStats()
+		fmt.Printf("📊 Collected: %d bytes\n", es.Size())
+		fmt.Printf("⌨️  Keystrokes: %d\n", len(es.timings))
+		fmt.Printf("⏱️  Avg timing: %.2f ms (±%.2f ms)\n", avgDelta, stdDev)
+		fmt.Printf("🎵 Rhythm variance: %.2f ms\n", stdDev)
+		fmt.Printf("🔐 Hash: %x...\n", es.hash[:8])
 	}
 
-	randomBuf := make([]byte, 4096)
-	written := int64(0)
-	for written < fileSize {
-		toWrite := int64(len(randomBuf))
-		if written+toWrite > fileSize {
-			toWrite = fileSize - written
-		}
+	return es, nil
+}
+
+// Combina le sorgenti di entropia
+func combineEntropy(challenge1, challenge2 *EntropySource, verbose bool) ([]byte, error) {
+	if verbose {
+		fmt.Println("\n🔀 COMBINING ENTROPY SOURCES")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	}
+
+	// Crea buffer combinato
+	combined := make([]byte, 0, len(challenge1.hash)+len(challenge2.hash)+32)
+	combined = append(combined, challenge1.hash...)
+	combined = append(combined, challenge2.hash...)
+
+	// Aggiungi crypto/rand
+	cryptoBytes := make([]byte, 32)
+	if _, err := rand.Read(cryptoBytes); err != nil {
+		return nil, fmt.Errorf("crypto/rand failed: %w", err)
+	}
+	combined = append(combined, cryptoBytes...)
+
+	// Hash finale
+	finalHash := sha256.Sum256(combined)
+
+	if verbose {
+		fmt.Printf("⚡ Challenge 1 hash: %x...\n", challenge1.hash[:8])
+		fmt.Printf("🎵 Challenge 2 hash: %x...\n", challenge2.hash[:8])
+		fmt.Printf("🎲 Crypto/rand: %x...\n", cryptoBytes[:8])
+		fmt.Printf("🔐 Final seed: %x...\n", finalHash[:8])
 		
-		if _, err := rand.Read(randomBuf[:toWrite]); err != nil {
-			return fmt.Errorf("random gen failed: %v", err)
-		}
-		
-		n, err := file.Write(randomBuf[:toWrite])
-		if err != nil {
-			return fmt.Errorf("write failed random pass: %v", err)
-		}
-		written += int64(n)
+		// Statistiche comparative
+		avg1, std1 := challenge1.TimingStats()
+		avg2, std2 := challenge2.TimingStats()
+		fmt.Printf("\n📈 Timing Analysis:\n")
+		fmt.Printf("   Challenge 1: %.2f ms avg, %.2f ms variance\n", avg1, std1)
+		fmt.Printf("   Challenge 2: %.2f ms avg, %.2f ms variance\n", avg2, std2)
+		fmt.Printf("   Difference: %.2f ms (higher = better)\n", abs(avg1-avg2))
 	}
 
-	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync failed random pass: %v", err)
+	return finalHash[:], nil
+}
+
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// Genera password usando l'entropia combinata
+func generatePassword(length int, seed []byte, verbose bool) (*memguard.LockedBuffer, error) {
+	if length < minLength || length > maxLength {
+		return nil, fmt.Errorf("invalid length: must be between %d and %d", minLength, maxLength)
 	}
 
 	if verbose {
-		fmt.Printf("✅ Pass %d/%d (random)\n", wipePatterns, wipePatterns)
+		fmt.Println("\n🔑 GENERATING PASSWORD")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		fmt.Printf("📏 Length: %d characters\n", length)
+		fmt.Printf("🎲 Charset: %d possible characters\n", len(charSet))
+		fmt.Printf("💪 Entropy: ~%.2f bits\n", float64(length)*6.5)
 	}
 
-	file.Close()
-	if err := os.Remove(filePath); err != nil {
-		return fmt.Errorf("failed to remove: %v", err)
+	// Crea buffer temporaneo per generare la password
+	tempPass := make([]byte, length)
+	
+	// Usa seed come fonte per PRNG deterministic
+	reader := sha256.New()
+	reader.Write(seed)
+
+	for i := 0; i < length; i++ {
+		// Genera nuovo hash ad ogni iterazione per più entropia
+		reader.Write(seed)
+		reader.Write([]byte{byte(i)})
+		hash := reader.Sum(nil)
+
+		// Usa hash per scegliere carattere
+		idx := binary.BigEndian.Uint32(hash[:4]) % uint32(len(charSet))
+		tempPass[i] = charSet[idx]
+
+		// Re-seed per prossima iterazione
+		reader.Reset()
+		reader.Write(hash)
 	}
+
+	// Crea buffer protetto con memguard dalla password generata
+	password := memguard.NewBufferFromBytes(tempPass)
+	defer func() {
+		if r := recover(); r != nil {
+			password.Destroy()
+			panic(r)
+		}
+	}()
+	
+	// Pulisci buffer temporaneo
+	memguard.WipeBytes(tempPass)
 
 	if verbose {
-		fmt.Printf("🔥 File securely wiped: %s\n", filePath)
+		fmt.Println("✅ Password generated in protected memory")
+	}
+
+	return password, nil
+}
+
+// Cripta password con Age
+func encrypt(password *memguard.LockedBuffer, passphrase, filename string) error {
+	recipient, err := age.NewScryptRecipient(passphrase)
+	if err != nil {
+		return fmt.Errorf("failed to create recipient: %w", err)
+	}
+
+	out, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer out.Close()
+
+	w, err := age.Encrypt(out, recipient)
+	if err != nil {
+		return fmt.Errorf("failed to create encrypted writer: %w", err)
+	}
+
+	if _, err := w.Write(password.Bytes()); err != nil {
+		return fmt.Errorf("failed to write encrypted data: %w", err)
+	}
+
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("failed to close encrypted writer: %w", err)
 	}
 
 	return nil
 }
 
-func readPasswordNoEchoSecure() (*memguard.LockedBuffer, error) {
-	fd := int(os.Stdin.Fd())
-	
-	if !term.IsTerminal(fd) {
-		return nil, fmt.Errorf("requires terminal")
+// Decripta password
+func decrypt(passphrase, filename string, verbose bool) error {
+	if verbose {
+		fmt.Println("\n🔓 DECRYPTING PASSWORD")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	}
-	
-	passwordBytes, err := term.ReadPassword(fd)
+
+	f, err := os.Open(filename)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to open file: %w", err)
 	}
+	defer f.Close()
+
+	identity, err := age.NewScryptIdentity(passphrase)
+	if err != nil {
+		return fmt.Errorf("failed to create identity: %w", err)
+	}
+
+	r, err := age.Decrypt(f, identity)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt (wrong passphrase?): %w", err)
+	}
+
+	password, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("failed to read decrypted data: %w", err)
+	}
+	defer memguard.WipeBytes(password)
+
+	fmt.Printf("\n🔐 Decrypted Password: %s\n", string(password))
+	
+	if verbose {
+		fmt.Printf("📏 Length: %d characters\n", len(password))
+	}
+
+	return nil
+}
+
+// Richiedi passphrase (nascosta)
+func promptPassphrase(prompt string) (string, error) {
+	fmt.Print(prompt)
+	passBytes, err := term.ReadPassword(int(syscall.Stdin))
 	fmt.Println()
-	
-	buffer := memguard.NewBufferFromBytes(passwordBytes)
-	secureWipe(passwordBytes)
-	buffer.Freeze()
-	
-	return buffer, nil
-}
-
-func secureWipe(data []byte) {
-	if data == nil {
-		return
-	}
-	rand.Read(data)
-	for i := range data {
-		data[i] = 0
-	}
-	runtime.GC()
-}
-
-func secureWipeString(s *string) {
-	if s == nil || *s == "" {
-		return
-	}
-	b := []byte(*s)
-	secureWipe(b)
-	*s = ""
-	runtime.GC()
-}
-
-func readSingleChar() (byte, error) {
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	return string(passBytes), nil
+}
 
-	reader := bufio.NewReader(os.Stdin)
-	char, err := reader.ReadByte()
-	return char, err
+// Cancellazione sicura DoD 5220.22-M (7-pass)
+func secureWipe(filename string, verbose bool) error {
+	if verbose {
+		fmt.Println("\n🔥 SECURE WIPE (DoD 5220.22-M)")
+		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		fmt.Printf("📁 Target: %s\n", filename)
+		fmt.Printf("🔄 Passes: %d\n\n", wipePassCount)
+	}
+
+	// Verifica file esiste
+	stat, err := os.Stat(filename)
+	if err != nil {
+		return fmt.Errorf("file not found: %w", err)
+	}
+
+	fileSize := stat.Size()
+	if verbose {
+		fmt.Printf("📊 File size: %d bytes\n\n", fileSize)
+	}
+
+	// Pattern di sovrascrittura DoD 5220.22-M
+	patterns := []byte{
+		0x00, // Pass 1: tutti zeri
+		0xFF, // Pass 2: tutti uno
+		0x00, // Pass 3: tutti zeri
+		0xFF, // Pass 4: tutti uno
+		0x00, // Pass 5: tutti zeri
+		0xFF, // Pass 6: tutti uno
+		// Pass 7: random (generato dopo)
+	}
+
+	// Esegui 7 pass
+	for i := 0; i < wipePassCount; i++ {
+		if verbose {
+			fmt.Printf("🔄 Pass %d/%d: ", i+1, wipePassCount)
+		}
+
+		// Apri file in write mode
+		f, err := os.OpenFile(filename, os.O_WRONLY, 0)
+		if err != nil {
+			return fmt.Errorf("failed to open file for wiping: %w", err)
+		}
+
+		var pattern []byte
+		if i < len(patterns) {
+			// Pattern fisso
+			pattern = make([]byte, fileSize)
+			for j := range pattern {
+				pattern[j] = patterns[i]
+			}
+			if verbose {
+				fmt.Printf("Writing 0x%02X pattern\n", patterns[i])
+			}
+		} else {
+			// Random pattern (pass 7)
+			pattern = make([]byte, fileSize)
+			rand.Read(pattern)
+			if verbose {
+				fmt.Println("Writing random data")
+			}
+		}
+
+		// Scrivi pattern
+		if _, err := f.Write(pattern); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to write pattern: %w", err)
+		}
+
+		// Sync su disco
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to sync: %w", err)
+		}
+
+		f.Close()
+	}
+
+	// Rimuovi file
+	if err := os.Remove(filename); err != nil {
+		return fmt.Errorf("failed to remove file: %w", err)
+	}
+
+	if verbose {
+		fmt.Println("\n✅ File securely wiped and removed!")
+	} else {
+		fmt.Printf("✅ %s securely wiped\n", filename)
+	}
+
+	return nil
 }
 
 func main() {
 	memguard.CatchInterrupt()
 	defer memguard.Purge()
 
-	length := flag.Int("l", defaultLength, "Password length (8-256)")
-	out := flag.String("o", defaultOutputFile, "Output file")
-	decrypt := flag.Bool("decrypt", false, "Decrypt password")
-	encfile := flag.String("encfile", "", "File to decrypt")
-	wipe := flag.Bool("wipe", false, "Secure wipe file")
-	wipefile := flag.String("wipefile", "", "File to wipe")
+	// Flags
+	length := flag.Int("l", defaultLength, "Password length")
+	output := flag.String("o", defaultOutputFile, "Output encrypted file")
+	decryptMode := flag.Bool("decrypt", false, "Decrypt mode")
+	encfile := flag.String("encfile", defaultOutputFile, "Encrypted file to decrypt")
+	wipeMode := flag.Bool("wipe", false, "Secure wipe mode")
+	wipefile := flag.String("wipefile", "", "File to securely wipe")
+	verbose := flag.Bool("v", false, "Verbose output")
 	showVersion := flag.Bool("version", false, "Show version")
-	verbose := flag.Bool("v", false, "Verbose")
+
 	flag.Parse()
 
+	// Version
 	if *showVersion {
-		fmt.Printf("gensecpass2-simple v%s\n", version)
-		fmt.Printf("Go %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-		fmt.Println("✨ Keyboard+Mouse Physical Entropy")
-		fmt.Println("🔐 Quantum-Resistant: Argon2id + AES-256-GCM")
-		fmt.Println("🔥 DoD 5220.22-M Secure Wipe")
-		fmt.Println("✅ NO NIST KEMs")
-		fmt.Println("✅ NO Cloudflare dependencies")
-		fmt.Println("✅ 100% Independent")
+		fmt.Printf("gensecpass2 v%s\n", version)
 		return
 	}
 
 	// Wipe mode
-	if *wipe {
+	if *wipeMode {
 		if *wipefile == "" {
-			fmt.Fprintln(os.Stderr, "Error: -wipefile required")
+			fmt.Println("❌ Error: -wipefile required for wipe mode")
 			os.Exit(1)
 		}
-		
-		fmt.Printf("⚠️  WARNING: PERMANENTLY destroy %s\n", *wipefile)
-		fmt.Print("Type 'YES' to confirm: ")
-		
+
+		fmt.Printf("⚠️  WARNING: This will PERMANENTLY destroy: %s\n", *wipefile)
+		fmt.Print("Are you absolutely sure? (type 'YES' to confirm): ")
+
 		reader := bufio.NewReader(os.Stdin)
-		confirm, _ := reader.ReadString('\n')
-		confirm = strings.TrimSpace(confirm)
-		
-		if confirm != "YES" {
-			fmt.Println("❌ Cancelled")
-			return
+		response, _ := reader.ReadString('\n')
+
+		if strings.TrimSpace(response) != "YES" {
+			fmt.Println("❌ Wipe cancelled")
+			os.Exit(0)
 		}
-		
-		if err := secureFileWipe(*wipefile, *verbose); err != nil {
-			fmt.Fprintf(os.Stderr, "Wipe error: %v\n", err)
+
+		if err := secureWipe(*wipefile, *verbose); err != nil {
+			fmt.Printf("❌ Wipe failed: %v\n", err)
 			os.Exit(1)
 		}
+
 		return
 	}
 
 	// Decrypt mode
-	if *decrypt {
-		if *encfile == "" {
-			fmt.Fprintln(os.Stderr, "Error: -encfile required")
+	if *decryptMode {
+		pass, err := promptPassphrase("Enter passphrase: ")
+		if err != nil {
+			fmt.Printf("❌ Error: %v\n", err)
 			os.Exit(1)
 		}
-		if err := decryptPassword(*encfile, *verbose); err != nil {
-			fmt.Fprintf(os.Stderr, "Decrypt error: %v\n", err)
+
+		if err := decrypt(pass, *encfile, *verbose); err != nil {
+			fmt.Printf("❌ Decryption failed: %v\n", err)
 			os.Exit(1)
 		}
+
 		return
 	}
 
-	// Validate length
-	if *length < minLength || *length > maxLength {
-		fmt.Fprintf(os.Stderr, "Error: Length %d-%d\n", minLength, maxLength)
-		os.Exit(1)
-	}
+	// Generate mode
+	fmt.Printf("╔════════════════════════════════════════════════════╗\n")
+	fmt.Printf("║       🔐 GENSECPASS2 v%s                      ║\n", version)
+	fmt.Printf("║   Ultra-Secure Password Generator                  ║\n")
+	fmt.Printf("║   Dual Keyboard Entropy Collection                 ║\n")
+	fmt.Printf("╚════════════════════════════════════════════════════╝\n")
 
-	outputPath := *out
-	if outputPath == "." {
-		outputPath = defaultOutputFile
-	}
-
-	fmt.Printf("╔════════════════════════════════════════════════════════════╗\n")
-	fmt.Printf("║    gensecpass2-simple v%s - Independent & Secure    ║\n", version)
-	fmt.Printf("║  🔐 Argon2id + AES-256 (NO NIST, NO Cloudflare)          ║\n")
-	fmt.Printf("║  ⌨️🖱️  Dual Physical Entropy Sources                       ║\n")
-	fmt.Printf("╚════════════════════════════════════════════════════════════╝\n\n")
-	fmt.Printf("🎯 Generating %d-character password\n\n", *length)
-
-	collector := NewEntropyCollector()
-
-	// Collect keyboard entropy
-	if err := collector.CollectKeyboardEntropy(minKeyEntropy, *verbose); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Keyboard error: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println()
-
-	// Collect mouse entropy
-	if err := collector.CollectMouseEntropy(minMouseEntropy, *verbose); err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Mouse error: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Combine entropy
-	combinedEntropy := collector.GetCombinedEntropy()
-	defer secureWipe(combinedEntropy)
-
-	if *verbose {
-		fmt.Printf("\n📊 Entropy: %d B (keyboard) + %d B (mouse) + 64 B (crypto)\n",
-			len(collector.keyboardData), len(collector.mouseData))
-	}
-
-	// Generate password
-	password, err := generateSecurePassword(*length, combinedEntropy)
+	// Step 1: Challenge 1 - Chaotic typing
+	challenge1, err := collectChallenge1Entropy(challenge1Target, *verbose)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Generation error: %v\n", err)
+		fmt.Printf("❌ Challenge 1 failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Ask to save
-	fmt.Print("\n💾 Save to encrypted file? (y/N): ")
-	saveChoice, err := readSingleChar()
+	// Step 2: Challenge 2 - Rhythmic typing
+	challenge2, err := collectChallenge2Entropy(challenge2Target, *verbose)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Input error: %v\n", err)
-		secureWipeString(&password)
+		fmt.Printf("❌ Challenge 2 failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println()
 
-	if saveChoice == 'y' || saveChoice == 'Y' {
-		if err := saveEncryptedPassword([]byte(password), outputPath, *verbose); err != nil {
-			fmt.Fprintf(os.Stderr, "Save error: %v\n", err)
-			secureWipeString(&password)
+	// Step 3: Combine entropy
+	seed, err := combineEntropy(challenge1, challenge2, *verbose)
+	if err != nil {
+		fmt.Printf("❌ Entropy combination failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Step 4: Generate password
+	password, err := generatePassword(*length, seed, *verbose)
+	if err != nil {
+		fmt.Printf("❌ Password generation failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer password.Destroy()
+
+	// Step 5: Save or display
+	fmt.Println("\n💾 SAVE OPTIONS")
+	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Print("Save encrypted password to file? (y/N): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, _ := reader.ReadString('\n')
+
+	if strings.TrimSpace(strings.ToLower(response)) == "y" {
+		pass, err := promptPassphrase("Enter passphrase: ")
+		if err != nil {
+			fmt.Printf("❌ Error: %v\n", err)
 			os.Exit(1)
 		}
-		secureWipeString(&password)
-		fmt.Println("\n✅ Password saved and wiped from memory")
-		fmt.Printf("📁 File: %s\n", outputPath)
-		fmt.Printf("💡 Decrypt: gensecpass2-simple -decrypt -encfile %s\n", outputPath)
-		fmt.Printf("💡 Wipe: gensecpass2-simple -wipe -wipefile %s\n", outputPath)
+
+		confirm, err := promptPassphrase("Confirm passphrase: ")
+		if err != nil {
+			fmt.Printf("❌ Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		if pass != confirm {
+			fmt.Println("❌ Passphrases don't match!")
+			os.Exit(1)
+		}
+
+		if err := encrypt(password, pass, *output); err != nil {
+			fmt.Printf("❌ Encryption failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("\n✅ Password saved to: %s\n", *output)
 	} else {
-		fmt.Printf("\n🔑 Generated Password: %s\n", password)
-		secureWipeString(&password)
-		fmt.Println("💀 Password wiped from memory (not saved)")
+		fmt.Println("\n🔐 Generated Password:", password.String())
+		fmt.Println("⚠️  Password displayed only (not saved)")
 	}
+
+	fmt.Println("\n🧹 Password destroyed from memory")
+	fmt.Println("✅ Session complete!")
 }
